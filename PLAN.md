@@ -8,9 +8,8 @@ after implementation: writing the fork sequence found ten places where the
 design was wrong or incomplete. They are listed in §0.1. The third review round
 was the compiler and the machine, so those changes are marked **[R3]**.
 
-**Status: M1–M5 implemented and tested.** 21 integration tests and 10 unit
-tests pass; the static `x86_64-unknown-linux-musl` binary is 455 KB. M6 (control
-verbs) is not started.
+**Status: M1–M6 implemented and tested.** 27 integration tests and 10 unit
+tests pass; the static `x86_64-unknown-linux-musl` binary is 463,536 bytes.
 
 ---
 
@@ -280,7 +279,14 @@ d-mon [options] [--] prog [args...]
   -l --logfile  -p --pidfile  -C --chdir  -u --user  -g --group
   -e --env  -t --timeout  -r --restart  -f --foreground  -k --no-close
   -R --reap  --stop-signal SIG  --stop-timeout SECS  --json  -v
+
+d-mon status  [-p PATH] [--json]
+d-mon signal SIG  [-p PATH] [--json]
+d-mon stop    [-p PATH] [--stop-timeout SECS] [--json]
 ```
+
+The first word decides: a verb acts on a pidfile and starts nothing; anything
+else is a program. `--` switches verb parsing off.
 
 `--json` emits one line:
 `{"outcome":"started","mode":"resident","supervisor":12,"child":13}`
@@ -303,11 +309,42 @@ inheritance, because attached supervision is the point of `-f`.
 | no `/etc/passwd` | numeric ids | n/a | n/a | n/a | n/a | n/a |
 | PID 1 | reaps, `kill(-1)`, no early exit | no | no | no | **yes** (`-s`) | **yes** |
 | supervisor death | `PDEATHSIG` | `PDEATHSIG` | n/a | n/a | `-p` | n/a |
+| status verb | **proves liveness by the pidfile lock** | own control socket | `--status` trusts the pid | n/a | n/a | n/a |
+| stop verb | waits for the lock release, so exit 0 means gone | own control socket | fire and forget | n/a | n/a | n/a |
 
 Honest note: on the *init* role d-mon does not beat tini or catatonit, which
 are older and simpler; it beats them only by also being a daemonizer and a
-library. On supervision it does not beat s6 or supervisord, which have control
-interfaces d-mon lacks (M6 scope).
+library. On supervision it does not beat s6 or supervisord, which have richer
+control interfaces (reload, per-service state) than the three verbs in §6.1.
+What it does differently on control is the identity check: `status` does not
+believe a pidfile, it takes the lock — see §6.1.
+
+### 6.1 Control verbs — **[R3]**
+
+A pidfile is a claim, not evidence. Between "the supervisor wrote 4711" and
+"kill 4711" the pid can be recycled, and a `kill(pid, 0)` check answers
+"somebody has that pid", which is exactly what is in doubt. So the verbs try to
+take the pidfile's `flock` themselves:
+
+| probe result | meaning | action |
+|---|---|---|
+| `LOCK_EX` succeeds | nobody holds it; the file is a leftover | report stopped, **never signal** |
+| `EWOULDBLOCK` | a live holder exists, and it is what wrote the file | trust the pid |
+
+```
+d-mon status [-p PATH] [--json]        exit 0 alive, 1 not
+ d-mon signal SIG [-p PATH] [--json]    exit 0 sent, 1 nothing to signal
+d-mon stop [-p PATH] [--json]          exit 0 stopped, 1 nothing to stop, 2 still up
+d-mon stop --stop-timeout SECS          how long to wait for the lock release
+```
+
+The pidfile holds two lines — supervisor, then delegate — and is rewritten under
+the lock on every spawn and exit. Line 1 is unchanged in meaning, so
+`kill $(cat pidfile)` still works. A reader can therefore see a torn file, which
+is why the verbs re-read for up to 200 ms before reporting `Uncertain`.
+
+`--` still means the end of options: `d-mon -- status` runs a program called
+`status`.
 
 ## 8. Test plan
 
@@ -333,7 +370,7 @@ M4 supervisor, log, pidfile, stop policy — **done** (SIGHUP rotation, grace th
 M5 reaper, PID 1 — **done for the detached supervisor**; the PID 1 path is
    written but **untested here**: this kernel refuses `unshare -pf`, so the test
    skips loudly rather than claim a pass.
-M6 control verbs (`status`/`signal`), docs, matrix
+M6 control verbs (`status`/`signal`/`stop`), docs, matrix — **done** (§6.1)
 
 Known gaps after M5:
 
@@ -343,10 +380,14 @@ Known gaps after M5:
   `/proc`, which this design refuses to do, so it reports the main child's exit
   and leaves them to be reparented.
 
-## 10. Remaining open questions
+## 10. Open questions, answered
 
-1. `StopPolicy` default: `SIGTERM` with a 10 s grace, then `SIGKILL`?
-2. Should `--restart` cap crash-loops (`max` in window) by default, or is that
-   policy the caller's?
-3. Is a control verb (`status`) in scope for 1.0, or does it belong to a
-   separate `d-mon-ctl` reading the pidfile?
+1. `StopPolicy` default: `SIGTERM`, 10 s grace, then `SIGKILL` — **yes**, and it
+   is what `--stop-timeout` overrides.
+2. Crash-loop cap: **the caller's policy**, via `Restart::max`. The CLI's
+   `--restart` passes `u32::MAX`, so it does not cap; that is a deliberate
+   choice for a CLI that should not invent a limit, and it is documented as a
+   gap rather than a feature.
+3. Control verbs: **in scope**, but as a separate `ctl` module talking to the
+   pidfile rather than a socket, so there is no new listening surface and no
+   `d-mon-ctl` binary to keep in step. See §6.1.

@@ -3,11 +3,12 @@
 Daemonize a program, supervise it, and reap when it is allowed to.
 One static binary, zero dependencies, usable as a CLI and as a library.
 
-**Status: M1–M5 done.** The detach sequence, the exec contract, the supervisor,
-the log and pidfile are implemented and tested (20 integration tests, 10 unit
-tests). 455 KB static `x86_64-unknown-linux-musl` binary. The design and the
-defects it was corrected for are in [PLAN.md](PLAN.md); the PID 1 path is
-written but untested here, because this kernel refuses `unshare -pf`.
+**Status: M1–M6 done.** The detach sequence, the exec contract, the supervisor,
+the log, the pidfile and the control verbs are implemented and tested (27
+integration tests, 10 unit tests). 463,536-byte static `x86_64-unknown-linux-musl`
+binary. The design and the defects it was corrected for are in
+[PLAN.md](PLAN.md); the PID 1 path is written but untested here, because this
+kernel refuses `unshare -pf`.
 
 ## Why another one
 
@@ -51,10 +52,23 @@ $ echo $?
 d-mon -l /var/log/app.log -p /run/app.pid -- /usr/bin/app --serve
 d-mon -f -- /usr/bin/app --serve          # supervise in place (container entrypoint)
 d-mon --json -p app.pid -- /usr/bin/app   # one machine-readable line
+
+d-mon status -p /run/app.pid               # exit 0 alive, 1 not
+d-mon signal USR2 -p /run/app.pid          # reached the delegate, not a stranger
+d-mon stop -p /run/app.pid                 # exit 0 only once it is really gone
 ```
 
 Detached, the delegate's stdio defaults to discarded; `-l` captures it into the
 log, and `-k` leaves it as inherited.
+
+## Control without trusting the pid
+
+A pidfile is a claim, not evidence — the pid inside can have been recycled.
+`status`, `signal` and `stop` therefore do not believe it: they try to take the
+pidfile's `flock` themselves. If the lock can be taken, nobody holds it, the
+file is a leftover, and nothing is signalled. If it cannot, the holder is alive
+and is the process that wrote the pid. No `/proc`, no start-time comparison, and
+no way to kill a stranger that inherited a recycled pid.
 
 ## Library
 
@@ -83,6 +97,7 @@ src/sys.rs        raw FFI; the only unsafe surface in the crate
 src/ready.rs      readiness records and the launcher state machine
 src/exec.rs       ExecPlan: everything materialised before the fork
 src/daemon.rs     the detach sequence
+src/ctl.rs        status / signal / stop, verified by the pidfile lock
 src/supervisor.rs the poll loop: forwarding, restart, stop policy, drains
 src/reaper.rs     subreaper lifecycle, waitpid policy
 src/log.rs        append sink, inode-verified reopen on SIGHUP
