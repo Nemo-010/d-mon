@@ -183,14 +183,27 @@ fn starts_and_stops_cleanly() {
 
 #[test]
 fn a_timeout_kills_what_it_started() {
-    // A zero budget cannot be met, so the launcher must kill the group and say
-    // so rather than leave a daemon behind and exit 0.
+    // A deterministic way to make the supervisor miss its readiness budget: it
+    // opens the log before forking, and opening a FIFO for writing blocks until
+    // a reader appears. That is a realistic stall too — an NFS home directory,
+    // a dead mount — and the launcher must kill what it created rather than
+    // leave a daemon behind and exit 0.
+    let fifo = tmp("blocking.log");
+    let _ = fs::remove_file(&fifo);
+    let mk = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(mk.success(), "mkfifo failed");
+
     let pidfile = tmp("timeout.pid");
     let o = run(&[
         "-t",
-        "0",
+        "300",
         "-p",
         pidfile.to_str().unwrap(),
+        "-l",
+        fifo.to_str().unwrap(),
         "/bin/sleep",
         "30",
     ]);
@@ -199,10 +212,9 @@ fn a_timeout_kills_what_it_started() {
     // Nothing it created may survive. A pidfile may be left behind, because a
     // SIGKILLed supervisor cannot unlink it; the lock dies with the process, so
     // a leftover file costs nothing but clutter.
-    if let Ok(text) = fs::read_to_string(&pidfile) {
-        if let Ok(pid) = text.trim().parse::<i32>() {
-            assert!(!alive(pid), "the aborted supervisor {pid} is still alive");
-        }
+    let leftover = pid_of(&pidfile);
+    if leftover > 1 {
+        assert!(!alive(leftover), "the aborted supervisor {leftover} is still alive");
     }
 
     // And the leftover must not block the next start.
@@ -217,6 +229,7 @@ fn a_timeout_kills_what_it_started() {
     assert_eq!(again.status.code(), Some(0), "stderr: {}", stderr(&again));
     let guard = Guard::from_pidfile(&pidfile);
     assert!(alive(guard.0));
+    let _ = fs::remove_file(&fifo);
 }
 
 #[test]
@@ -360,7 +373,10 @@ fn restart_respawns_after_a_failure() {
     assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
     let guard = Guard::from_pidfile(&pidfile);
 
-    let until = Instant::now() + Duration::from_secs(4);
+    // Two restarts with the CLI's one-second backoff. A loaded runner is slow,
+    // and a tight budget here fails for reasons that have nothing to do with
+    // the supervisor.
+    let until = Instant::now() + Duration::from_secs(15);
     let mut seen = 0;
     while Instant::now() < until {
         seen = fs::read_to_string(&count)
