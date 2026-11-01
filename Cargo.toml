@@ -1,0 +1,27 @@
+[package]
+name = "d-mon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "0BSD"
+description = "Daemonize a program, supervise it, and reap when allowed to"
+repository = "https://github.com/Nemo-010/d-mon"
+keywords = ["daemon", "supervisor", "init", "container", "pid1"]
+categories = ["command-line-utilities", "os::unix-apis"]
+
+[lib]
+name = "d_mon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "d-mon"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
