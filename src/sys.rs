@@ -41,6 +41,7 @@ pub const F_SETFL: c_int = 4;
 
 pub const LOCK_EX: c_int = 2;
 pub const LOCK_NB: c_int = 4;
+pub const LOCK_UN: c_int = 8;
 
 pub const WNOHANG: c_int = 1;
 

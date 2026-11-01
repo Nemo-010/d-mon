@@ -31,7 +31,16 @@ usage: d-mon [options] [--] prog [args...]
   -h, --help             this text
   -V, --version          print the version
 
-exit: 0 started, 1 failed to start, 2 unconfirmed, 3 already running
+verbs, which act on a pidfile instead of starting anything:
+
+  status [-p PATH]                 is a supervisor alive? (exit 0 yes, 1 no)
+  signal SIG [-p PATH]             send a signal to the supervisor (1 if none)
+  stop [-p PATH] [--stop-timeout]  SIGTERM, then wait until it is really gone
+                                   (0 stopped, 1 nothing to stop, 2 still up)
+
+`d-mon -- status` runs a program called status instead.
+
+exit: 0 ok, 1 failed / not running, 2 unconfirmed, 3 already running
 ";
 
 struct Opts {
@@ -77,11 +86,24 @@ impl Default for Opts {
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1).peekable();
     let mut o = Opts::default();
+    let mut verb: Option<Verb> = None;
 
     while let Some(a) = args.next() {
         let s = a.to_string_lossy().into_owned();
         match s.as_str() {
-            "--" => break,
+            "--" => {
+                // Everything after `--` is the program, even a name that looks
+                // like a verb.
+                let mut tail: Vec<OsString> = Vec::new();
+                if let Some(first) = args.next() {
+                    tail.push(first);
+                }
+                tail.extend(args);
+                if tail.is_empty() {
+                    return fail(&o, "no program given after --");
+                }
+                return run(&o, tail);
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -119,6 +141,22 @@ fn main() -> ExitCode {
             "-v" | "--verbose" => o.verbose = true,
             _ if s.starts_with('-') => return fail(&o, &format!("unknown option {s}")),
             _ => {
+                // The first word decides: a verb acts on a pidfile, anything
+                // else is a program to start.
+                if verb.is_none() {
+                    if let Some(v) = Verb::parse(&s) {
+                        verb = Some(v);
+                        continue;
+                    }
+                }
+                if let Some(v) = verb.as_mut() {
+                    if let Some(want) = v.needs_arg() {
+                        if want {
+                            v.give_arg(a);
+                            continue;
+                        }
+                    }
+                }
                 let mut tail = vec![a];
                 tail.extend(args);
                 return run(&o, tail);
@@ -126,7 +164,50 @@ fn main() -> ExitCode {
         }
     }
 
+    if let Some(v) = verb {
+        return ctl(&o, v);
+    }
     fail(&o, "no program given (try --help)")
+}
+
+/// A control verb. They never start anything; they read the pidfile.
+enum Verb {
+    Status,
+    Signal(Option<OsString>),
+    Stop,
+}
+
+impl Verb {
+    fn parse(s: &str) -> Option<Verb> {
+        match s {
+            "status" => Some(Verb::Status),
+            "signal" => Some(Verb::Signal(None)),
+            "stop" => Some(Verb::Stop),
+            _ => None,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Verb::Status => "status",
+            Verb::Signal(_) => "signal",
+            Verb::Stop => "stop",
+        }
+    }
+
+    /// Whether the verb still wants its argument.
+    fn needs_arg(&self) -> Option<bool> {
+        match self {
+            Verb::Signal(None) => Some(true),
+            Verb::Signal(Some(_)) | Verb::Status | Verb::Stop => Some(false),
+        }
+    }
+
+    fn give_arg(&mut self, a: OsString) {
+        if let Verb::Signal(slot) = self {
+            *slot = Some(a);
+        }
+    }
 }
 
 fn number(args: &mut impl Iterator<Item = OsString>) -> Option<u64> {
@@ -304,4 +385,137 @@ fn fail(o: &Opts, msg: &str) -> ExitCode {
         eprintln!("d-mon: {msg}");
     }
     ExitCode::from(1)
+}
+fn ctl(o: &Opts, verb: Verb) -> ExitCode {
+    let Some(p) = o.pidfile.as_ref() else {
+        return fail(o, &format!("{} needs --pidfile PATH", verb.name()));
+    };
+    let path = std::path::PathBuf::from(p);
+
+    let outcome = match &verb {
+        Verb::Status => d_mon::ctl::status(&path).map(|st| report_state(o, &path, &st, None)),
+        Verb::Signal(sig) => {
+            let Some(sig) = sig else {
+                return fail(o, "signal needs a signal name or number");
+            };
+            match parse_signal(sig) {
+                Some(n) => d_mon::ctl::signal(&path, n)
+                    .map(|st| report_state(o, &path, &st, Some(n))),
+                None => return fail(o, "unknown signal"),
+            }
+        }
+        Verb::Stop => {
+            let want = Duration::from_secs(o.stop_secs.saturating_add(1));
+            d_mon::ctl::stop(&path, sys::SIGTERM, want).map(|(st, gone)| {
+                let was_running = st.is_running();
+                report_state(o, &path, &st, Some(sys::SIGTERM));
+                match (was_running, gone) {
+                    // Stopped something that was running: done.
+                    (true, true) => 0,
+                    // Still there: the caller must not be told it worked.
+                    (true, false) => {
+                        if !o.json {
+                            eprintln!("d-mon: still running after the timeout");
+                        }
+                        2
+                    }
+                    // Nothing was running: say so, and do not let a mistyped
+                    // pidfile pass as a successful stop.
+                    _ => 1,
+                }
+            })
+        }
+    };
+
+    match outcome {
+        Ok(code) => ExitCode::from(code as u8),
+        Err(e) => report(o, e),
+    }
+}
+
+/// Print what the pidfile said. Returns the exit code the verb should use.
+fn report_state(o: &Opts, path: &std::path::Path, st: &d_mon::ctl::State, sig: Option<i32>) -> i32 {
+    use d_mon::ctl::{State, Stopped};
+
+    if o.json {
+        let body = match st {
+            State::Running {
+                supervisor,
+                child,
+            } => format!(
+                "{{\"state\":\"running\",\"pidfile\":\"{}\",\"supervisor\":{supervisor},\"child\":{}}}",
+                escape(&path.to_string_lossy()),
+                child.map(|c| c.to_string()).unwrap_or_else(|| "null".into())
+            ),
+            State::Stopped { reason } => format!(
+                "{{\"state\":\"stopped\",\"pidfile\":\"{}\",\"reason\":\"{}\"}}",
+                escape(&path.to_string_lossy()),
+                match reason {
+                    Stopped::NoPidfile => "no-pidfile",
+                    Stopped::Stale => "stale",
+                    Stopped::Vanished => "vanished",
+                }
+            ),
+            State::Uncertain => format!(
+                "{{\"state\":\"uncertain\",\"pidfile\":\"{}\"}}",
+                escape(&path.to_string_lossy())
+            ),
+        };
+        println!("{body}");
+    } else {
+        match st {
+            State::Running {
+                supervisor,
+                child,
+            } => match child {
+                Some(c) => println!(
+                    "running: supervisor {supervisor}, delegate {c} ({})",
+                    path.display()
+                ),
+                None => println!(
+                    "running: supervisor {supervisor}, no delegate ({})",
+                    path.display()
+                ),
+            },
+            State::Stopped { reason } => println!(
+                "not running: {} ({})",
+                match reason {
+                    Stopped::NoPidfile => "no pidfile",
+                    Stopped::Stale => "stale pidfile, nothing holds its lock",
+                    Stopped::Vanished => "the lock is held but that pid is gone",
+                },
+                path.display()
+            ),
+            State::Uncertain => println!(
+                "running, but the pid could not be read ({})",
+                path.display()
+            ),
+        }
+    }
+
+    match st {
+        State::Running { .. } => {
+            if let Some(sig) = sig {
+                if !o.json {
+                    println!("sent {}", signal_name(sig));
+                }
+            }
+            0
+        }
+        State::Stopped { .. } => 1,
+        State::Uncertain => 0,
+    }
+}
+
+fn signal_name(sig: i32) -> String {
+    match sig {
+        sys::SIGHUP => "SIGHUP".into(),
+        sys::SIGINT => "SIGINT".into(),
+        sys::SIGQUIT => "SIGQUIT".into(),
+        sys::SIGKILL => "SIGKILL".into(),
+        sys::SIGUSR1 => "SIGUSR1".into(),
+        sys::SIGUSR2 => "SIGUSR2".into(),
+        sys::SIGTERM => "SIGTERM".into(),
+        other => format!("signal {other}"),
+    }
 }

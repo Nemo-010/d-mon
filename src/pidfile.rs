@@ -18,6 +18,7 @@ use crate::sys;
 pub struct Pidfile {
     path: PathBuf,
     file: File,
+    supervisor: i32,
 }
 
 impl Pidfile {
@@ -98,7 +99,26 @@ impl Pidfile {
         Ok(Some(Pidfile {
             path: path.to_path_buf(),
             file,
+            supervisor: pid,
         }))
+    }
+
+    /// Record the delegate's pid beside the supervisor's.
+    ///
+    /// Line 1 stays the supervisor pid, so `kill $(cat pidfile)` keeps working
+    /// and so does every script written against it. Line 2 is the child, empty
+    /// while there is none. The rewrite happens under the lock the process
+    /// already holds, which is why a reader can trust it: an empty or torn file
+    /// is only visible to someone who already knows a holder exists.
+    pub fn set_child(&mut self, child: Option<i32>) {
+        let mut body = format!("{}\n", self.supervisor);
+        if let Some(c) = child {
+            body.push_str(&format!("{c}\n"));
+        }
+        let _ = self.file.set_len(0);
+        let _ = self.file.seek(SeekFrom::Start(0));
+        let _ = self.file.write_all(body.as_bytes());
+        let _ = self.file.sync_all();
     }
 
     pub fn path(&self) -> &Path {

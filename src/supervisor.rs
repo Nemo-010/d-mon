@@ -206,6 +206,9 @@ impl Supervisor {
         self.drains.append(&mut planned.drains);
         self.child = Some(pid);
         self.phase = Phase::Running;
+        if let Some(p) = self.pidfile.as_mut() {
+            p.set_child(Some(pid));
+        }
         Ok(pid)
     }
 
@@ -272,6 +275,9 @@ impl Supervisor {
     /// `SIGKILL`, and reap so nothing is left as a zombie the caller cannot see.
     fn abort_start(&mut self) {
         let child = self.child.take();
+        if let Some(p) = self.pidfile.as_mut() {
+            p.set_child(None);
+        }
         if let Some(pid) = child {
             for sig in [self.cmd.stop.signal, sys::SIGKILL] {
                 // SAFETY: signalling a pid we forked.
@@ -453,6 +459,9 @@ impl Supervisor {
                     if Some(pid) == self.child {
                         main = Some(status);
                         self.child = None;
+                        if let Some(p) = self.pidfile.as_mut() {
+                            p.set_child(None);
+                        }
                     }
                 }
                 Err(sys::EINTR) => continue,

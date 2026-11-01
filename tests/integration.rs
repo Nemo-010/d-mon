@@ -38,8 +38,38 @@ fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
+/// Line 1 of a pidfile is the supervisor. Line 2 is the delegate.
+fn pid_of(p: &Path) -> i32 {
+    fs::read_to_string(p)
+        .ok()
+        .and_then(|s| s.lines().next().and_then(|l| l.trim().parse().ok()))
+        .unwrap_or(0)
+}
+
+/// Whether the process is still *doing* something.
+///
+/// `kill(pid, 0)` is not enough: a zombie answers it until whoever forked it
+/// reaps, and a container whose init does not reap keeps zombies around. The
+/// tests care about the process being gone, so the state is checked too. (The
+/// product must not read /proc; a test may.)
 fn alive(pid: i32) -> bool {
-    unsafe { d_mon::sys::kill(pid, 0) == 0 }
+    if pid <= 1 {
+        return false;
+    }
+    if unsafe { d_mon::sys::kill(pid, 0) != 0 } {
+        return false;
+    }
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(s) => {
+            // Field 3 is the state, after the "(comm)" field which may contain
+            // spaces.
+            let rest = s.rsplit_once(')').map(|(_, r)| r).unwrap_or("");
+            let state = rest.split_whitespace().next().unwrap_or("");
+            state != "Z" && state != "X"
+        }
+        // No /proc: fall back to the signal check rather than lie.
+        Err(_) => true,
+    }
 }
 
 /// Kill a supervisor and wait for it to be gone, so tests do not leak.
@@ -47,11 +77,7 @@ struct Guard(i32);
 
 impl Guard {
     fn from_pidfile(p: &Path) -> Guard {
-        let pid = fs::read_to_string(p)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        Guard(pid)
+        Guard(pid_of(p))
     }
 }
 
@@ -121,11 +147,8 @@ fn starts_and_stops_cleanly() {
     ]);
     assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
 
-    let sup: i32 = fs::read_to_string(&pidfile)
-        .unwrap()
-        .trim()
-        .parse()
-        .expect("pidfile must hold the supervisor pid");
+    let sup = pid_of(&pidfile);
+    assert!(sup > 1, "pidfile must hold the supervisor pid");
     let guard = Guard(sup);
     assert!(alive(sup), "supervisor must be alive");
 
@@ -505,7 +528,7 @@ fn a_child_that_ignores_term_is_killed_after_the_grace() {
         &format!("trap '' TERM; : > {}; sleep 60", ready.display()),
     ]);
     assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
-    let sup: i32 = fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    let sup = pid_of(&pidfile);
     let guard = Guard(sup);
     // The trap must exist before the signal, or the test measures a race.
     let until = Instant::now() + Duration::from_secs(3);
@@ -549,7 +572,7 @@ fn sighup_reopens_a_rotated_log() {
         &script,
     ]);
     assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
-    let sup: i32 = fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    let sup = pid_of(&pidfile);
     let guard = Guard(sup);
 
     // Two things must be true before the rotation is meaningful: the delegate
@@ -630,7 +653,7 @@ fn a_stop_outranks_the_restart_policy() {
         "exit 1",
     ]);
     assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
-    let sup: i32 = fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    let sup = pid_of(&pidfile);
     let guard = Guard(sup);
     std::thread::sleep(Duration::from_millis(200));
 
@@ -641,4 +664,161 @@ fn a_stop_outranks_the_restart_policy() {
     }
     assert!(!alive(sup), "a restarting supervisor must still honour SIGTERM");
     drop(guard);
+}
+
+// ---- control verbs -------------------------------------------------------
+
+#[test]
+fn status_reports_a_live_supervisor_and_its_delegate() {
+    let pidfile = tmp("ctl.pid");
+    let o = run(&[
+        "-p",
+        pidfile.to_str().unwrap(),
+        "-l",
+        &tmp("ctl.log").to_string_lossy(),
+        "/bin/sleep",
+        "30",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let guard = Guard::from_pidfile(&pidfile);
+
+    let st = run(&["status", "-p", pidfile.to_str().unwrap()]);
+    assert_eq!(st.status.code(), Some(0), "stderr: {}", stderr(&st));
+    let text = stdout(&st);
+    assert!(text.contains(&format!("supervisor {}", guard.0)), "{text}");
+    assert!(text.contains("delegate"), "{text}");
+
+    let js = run(&["--json", "status", "-p", pidfile.to_str().unwrap()]);
+    assert_eq!(js.status.code(), Some(0));
+    let j = stdout(&js);
+    assert!(j.contains("\"state\":\"running\""), "{j}");
+    assert!(j.contains(&format!("\"supervisor\":{}", guard.0)), "{j}");
+}
+
+#[test]
+fn status_of_nothing_is_exit_1() {
+    let absent = tmp("ctl-absent.pid");
+    let _ = fs::remove_file(&absent);
+    let o = run(&["status", "-p", absent.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "stderr: {}", stderr(&o));
+
+    // A pidfile no process holds is stale, not running — even when the pid in
+    // it happens to be alive right now.
+    let victim = Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("stranger");
+    let stale = tmp("ctl-stale.pid");
+    fs::write(&stale, format!("{}\n", victim.id())).unwrap();
+    let o = run(&["status", "-p", stale.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "stderr: {}", stderr(&o));
+    assert!(stdout(&o).contains("stale"), "{}", stdout(&o));
+    drop(victim);
+    let _ = fs::remove_file(&stale);
+}
+
+#[test]
+fn verbs_never_signal_a_stranger_from_a_stale_pidfile() {
+    // The pidfile names a live process that is not a supervisor. Signalling it
+    // would be the classic pidfile bug: the pid was recycled.
+    let mut stranger = Command::new("/bin/sleep")
+        .arg("20")
+        .spawn()
+        .expect("stranger");
+    let stale = tmp("ctl-victim.pid");
+    fs::write(&stale, format!("{}\n", stranger.id())).unwrap();
+
+    let o = run(&["stop", "-p", stale.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1), "stderr: {}", stderr(&o));
+    assert!(
+        stranger.try_wait().expect("poll stranger").is_none(),
+        "stop killed a process that was not ours"
+    );
+
+    let s = run(&["signal", "KILL", "-p", stale.to_str().unwrap()]);
+    assert_eq!(s.status.code(), Some(1), "stderr: {}", stderr(&s));
+    assert!(
+        stranger.try_wait().expect("poll stranger").is_none(),
+        "signal killed a process that was not ours"
+    );
+
+    let _ = stranger.kill();
+    let _ = stranger.wait();
+    let _ = fs::remove_file(&stale);
+}
+
+#[test]
+fn stop_waits_until_the_supervisor_is_really_gone() {
+    let pidfile = tmp("ctl-stop.pid");
+    let o = run(&[
+        "-p",
+        pidfile.to_str().unwrap(),
+        "-l",
+        &tmp("ctl-stop.log").to_string_lossy(),
+        "/bin/sleep",
+        "30",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let guard = Guard::from_pidfile(&pidfile);
+
+    let st = run(&["stop", "-p", pidfile.to_str().unwrap()]);
+    assert_eq!(st.status.code(), Some(0), "stderr: {}", stderr(&st));
+    // Exit 0 must mean the process is gone, not merely asked.
+    assert!(!alive(guard.0), "stop returned success with the supervisor alive");
+    let after = run(&["status", "-p", pidfile.to_str().unwrap()]);
+    assert_eq!(after.status.code(), Some(1), "stderr: {}", stderr(&after));
+    drop(guard);
+}
+
+#[test]
+fn signal_reaches_the_delegate_through_the_supervisor() {
+    let pidfile = tmp("ctl-usr2.pid");
+    let seen = tmp("ctl-usr2.txt");
+    let _ = fs::remove_file(&seen);
+    let script = format!(
+        "trap 'echo got > {}' USR2; : > {}; while :; do sleep 0.02; done",
+        seen.display(),
+        tmp("ctl-usr2.ready").display()
+    );
+    let o = run(&[
+        "-p",
+        pidfile.to_str().unwrap(),
+        "-l",
+        &tmp("ctl-usr2.log").to_string_lossy(),
+        "/bin/sh",
+        "-c",
+        &script,
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let guard = Guard::from_pidfile(&pidfile);
+
+    let ready = tmp("ctl-usr2.ready");
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !ready.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "the delegate never installed its trap");
+
+    let s = run(&["signal", "USR2", "-p", pidfile.to_str().unwrap()]);
+    assert_eq!(s.status.code(), Some(0), "stderr: {}", stderr(&s));
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !seen.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(seen.exists(), "the signal never reached the delegate");
+    let _ = fs::remove_file(&seen);
+    let _ = fs::remove_file(&ready);
+    drop(guard);
+}
+
+#[test]
+fn dashdash_runs_a_program_named_like_a_verb() {
+    let log = tmp("ctl-dd.log");
+    let _ = fs::remove_file(&log);
+    // `--` must switch off verb parsing entirely.
+    let o = run(&["--", "/bin/sh", "-c", &format!("echo dd > {}", log.display())]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let text = wait_for_file(&log);
+    assert!(text.contains("dd"), "got {text:?}");
+    let _ = fs::remove_file(&log);
 }

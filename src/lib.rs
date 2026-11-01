@@ -23,6 +23,7 @@
 #![allow(missing_docs)]
 
 pub mod command;
+pub mod ctl;
 pub mod daemon;
 pub mod error;
 pub mod exec;
@@ -35,6 +36,7 @@ pub(crate) mod supervisor;
 pub mod sys;
 
 pub use command::{Command, Id, Restart, StopPolicy};
+pub use ctl::{State, Stopped};
 pub use daemon::{Mode, Started};
 pub use error::{Error, Fail, Result, Stage};
 pub use reaper::Reap;
