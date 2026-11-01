@@ -996,3 +996,46 @@ fn verbose_says_what_it_decided() {
     assert!(stdout(&o).is_empty(), "stdout: {}", stdout(&o));
     drop(guard);
 }
+
+#[test]
+fn stop_signal_is_honoured_end_to_end() {
+    // --stop-signal is the signal the supervisor sends its delegate on a stop;
+    // the delegate here records which one it saw.
+    let pidfile = tmp("stopsig.pid");
+    let seen = tmp("stopsig.txt");
+    let ready = tmp("stopsig.ready");
+    let _ = fs::remove_file(&seen);
+    let _ = fs::remove_file(&ready);
+    let script = format!(
+        "trap 'echo INT > {}; exit 0' INT; trap 'echo TERM > {}; exit 0' TERM; : > {}; while :; do sleep 0.05; done",
+        seen.display(),
+        seen.display(),
+        ready.display()
+    );
+    let o = run(&[
+        "--stop-signal",
+        "INT",
+        "-p",
+        pidfile.to_str().unwrap(),
+        "-l",
+        &tmp("stopsig.log").to_string_lossy(),
+        "/bin/sh",
+        "-c",
+        &script,
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let guard = Guard::from_pidfile(&pidfile);
+
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !ready.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "the delegate never installed its traps");
+
+    let st = run(&["stop", "-p", pidfile.to_str().unwrap()]);
+    assert_eq!(st.status.code(), Some(0), "stderr: {}", stderr(&st));
+    let text = wait_for_file(&seen);
+    assert!(text.contains("INT"), "the wrong stop signal arrived: {text:?}");
+    assert!(!text.contains("TERM"), "both signals arrived: {text:?}");
+    drop(guard);
+}

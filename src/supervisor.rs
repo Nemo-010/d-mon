@@ -424,7 +424,12 @@ impl Supervisor {
                             killed: false,
                         };
                     }
-                    self.forward(*sig);
+                    // The delegate gets the configured stop signal, not
+                    // whichever signal asked for the stop: `--stop-signal INT`
+                    // has to mean something even when the request arrives as
+                    // SIGTERM.
+                    let sig = self.cmd.stop.signal;
+                    self.forward(sig);
                 }
                 sys::SIGUSR1 | sys::SIGUSR2 => self.forward(*sig),
                 _ => {}

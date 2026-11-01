@@ -8,7 +8,7 @@ after implementation: writing the fork sequence found ten places where the
 design was wrong or incomplete. They are listed in §0.1. The third review round
 was the compiler and the machine, so those changes are marked **[R3]**.
 
-**Status: M1–M6 implemented and tested.** 35 integration tests and 10 unit
+**Status: M1–M6 implemented and tested.** 36 integration tests and 13 unit
 tests pass; the static `x86_64-unknown-linux-musl` binary is 463,536 bytes.
 
 ---
@@ -253,6 +253,13 @@ Handlers for every signal acted on (a `SIG_DFL` signal is not deliverable to
 namespace init from inside the namespace). Shutdown forwards with
 `kill(-1, sig)` — init semantics, reaching orphans in their own groups — then
 `SIGKILL` after `StopPolicy::grace`. Never exit while descendants live.
+
+**[R3]** A stop request — `SIGTERM`, `SIGINT` or `SIGQUIT` — tells the delegate
+`StopPolicy::signal`, not whichever signal asked for the stop. Otherwise
+`--stop-signal INT` would only take effect when the start is aborted, since
+`d-mon stop` (and every init that stops a service) arrives as `SIGTERM`.
+`SIGHUP`, `SIGUSR1` and `SIGUSR2` are forwarded unchanged and are not stop
+requests.
 
 ### 5.5 Log and pidfile — **[R2] no rename**
 

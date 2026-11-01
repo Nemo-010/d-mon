@@ -108,6 +108,16 @@ impl Drop for Planned {
 
 /// Resolve the descriptor plan. Everything is opened here, pre-fork.
 pub(crate) fn plan(cmd: &crate::Command, log: Option<&Log>) -> Result<Planned, Fail> {
+    plan_with(cmd, log, "/dev/null")
+}
+
+/// The real planner, with the null device named so that the degradation chain
+/// below it can be tested on a machine that does have a `/dev/null`.
+fn plan_with(
+    cmd: &crate::Command,
+    log: Option<&Log>,
+    null: &str,
+) -> Result<Planned, Fail> {
     let mut p = Planned::default();
     p.fds = [0, 1, 2];
     p.sink = Sink::NullDevice;
@@ -147,7 +157,7 @@ pub(crate) fn plan(cmd: &crate::Command, log: Option<&Log>) -> Result<Planned, F
                 p.child_only.push(w);
                 p.drains.push(Drain { fd: r, to_log: true });
             }
-            Stdio::Discard => match open_null(slot == 0) {
+            Stdio::Discard => match open_null(null, slot == 0) {
                 Ok(fd) => {
                     p.fds[slot] = fd;
                     p.child_only.push(fd);
@@ -182,8 +192,9 @@ pub(crate) fn plan(cmd: &crate::Command, log: Option<&Log>) -> Result<Planned, F
     Ok(p)
 }
 
-fn open_null(read: bool) -> Result<i32, i32> {
-    let p = b"/dev/null\0";
+fn open_null(path: &str, read: bool) -> Result<i32, i32> {
+    let p = format!("{path}\0");
+    let p = p.into_bytes();
     let flags = if read { sys::O_RDONLY } else { sys::O_WRONLY };
     // SAFETY: a NUL-terminated path and fixed flags.
     let fd = unsafe { sys::openat(-100, p.as_ptr() as *const _, flags | sys::O_CLOEXEC, 0) };
@@ -230,4 +241,54 @@ fn pipe() -> Result<(i32, i32), Fail> {
         return Err(Fail::new(Stage::Open, sys::errno(), "pipe2"));
     }
     Ok((fds[0], fds[1]))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Command;
+
+    /// With a null device, `Discard` uses it and opens no pipe.
+    #[test]
+    fn discard_prefers_the_null_device() {
+        let cmd = Command::new("/bin/echo")
+            .stdin(Stdio::Discard)
+            .stdout(Stdio::Discard)
+            .stderr(Stdio::Discard);
+        let mut p = plan_with(&cmd, None, "/dev/null").unwrap();
+        assert_eq!(p.sink, Sink::NullDevice);
+        assert!(p.drains.is_empty(), "nothing to drain: {:?}", p.drains);
+        for fd in p.fds {
+            assert_ne!(fd, 1, "stdout must not be the inherited one");
+        }
+        p.close_child_ends();
+    }
+
+    /// Without one, it degrades to a drained pipe — not to `open("/")`, and not
+    /// to `/dev/zero`, which never EOFs on read.
+    #[test]
+    fn discard_degrades_to_a_drained_pipe() {
+        let cmd = Command::new("/bin/echo")
+            .stdin(Stdio::Discard)
+            .stdout(Stdio::Discard)
+            .stderr(Stdio::Discard);
+        let mut p = plan_with(&cmd, None, "/nonexistent/dev/null").unwrap();
+        assert_eq!(p.sink, Sink::DrainedPipe);
+        // stdout and stderr each get a write end the supervisor drains.
+        assert_eq!(p.drains.len(), 2, "{:?}", p.drains);
+        assert!(p.drains.iter().all(|d| !d.to_log), "discard drops bytes");
+        // stdin gets a read end whose write end is already closed, so a reader
+        // sees EOF rather than blocking.
+        assert_ne!(p.fds[0], 0, "stdin must not be the inherited one");
+        p.close_child_ends();
+        // The drain ends belong to the parent and are still open here, so the
+        // drop closes them.
+    }
+
+    /// `Capture` needs somewhere to put the bytes.
+    #[test]
+    fn capture_without_a_log_is_an_error() {
+        let cmd = Command::new("/bin/echo").stdout(Stdio::Capture);
+        let e = plan_with(&cmd, None, "/dev/null").unwrap_err();
+        assert_eq!(e.stage, Stage::PreFork);
+    }
 }

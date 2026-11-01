@@ -4,8 +4,8 @@ Daemonize a program, supervise it, and reap when it is allowed to.
 One static binary, zero dependencies, usable as a CLI and as a library.
 
 **Status: M1–M6 done.** The detach sequence, the exec contract, the supervisor,
-the log, the pidfile and the control verbs are implemented and tested (35
-integration tests, 10 unit tests). 463,536-byte static `x86_64-unknown-linux-musl`
+the log, the pidfile and the control verbs are implemented and tested (36
+integration tests, 13 unit tests). 463,536-byte static `x86_64-unknown-linux-musl`
 binary. The design and the defects it was corrected for are in
 [PLAN.md](PLAN.md); the PID 1 path is written but untested here, because this
 kernel refuses `unshare -pf`.
