@@ -387,13 +387,23 @@ M5 reaper, PID 1 — **done for the detached supervisor**; the PID 1 path is
    skips loudly rather than claim a pass.
 M6 control verbs (`status`/`signal`/`stop`), docs, matrix — **done** (§6.1)
 
-Known gaps after M5:
+Known gaps after M6:
 
-* `StopPolicy`/`Restart` are honoured but there is no crash-loop cap beyond
-  `Restart::max`; `--restart` on the CLI passes `u32::MAX`.
+* **PID 1 is untested here.** The code is written and the test exists, but this
+  kernel refuses `unshare -pf`, so the test prints `SKIPPED` and the path is
+  unverified until it runs somewhere that allows a PID namespace.
+* `Restart::max` is the only crash-loop cap, and the CLI's `--restart` passes
+  `u32::MAX`, so the CLI itself never gives up. Deliberate, but it is a gap for
+  anyone who wanted `--restart` to be safe by default.
 * A non-init subreaper cannot enumerate the orphans it adopted without reading
   `/proc`, which this design refuses to do, so it reports the main child's exit
   and leaves them to be reparented.
+* One supervisor per process (a signal handler is process-wide), so a library
+  cannot supervise two unrelated delegations from one process. Documented as
+  `EBUSY`, not silently tolerated.
+* The control verbs reach the supervisor, not the delegate: there is no
+  `d-mon signal --delegate` and no per-service state, which is where s6 and
+  supervisord are still ahead.
 
 ## 10. Open questions, answered
 

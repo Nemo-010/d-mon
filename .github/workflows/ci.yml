@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: build
+        run: cargo build --locked --release
+
+      - name: test
+        # The suite forks real daemons and reads /proc, which a normal Linux
+        # runner allows. The PID 1 test reports SKIPPED where `unshare -pf` is
+        # refused rather than passing without testing anything.
+        run: cargo test --locked --release -- --nocapture
+
+      - name: static build
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/release/d-mon
+          target/x86_64-unknown-linux-musl/release/d-mon --version
