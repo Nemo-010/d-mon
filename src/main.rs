@@ -21,6 +21,7 @@ usage: d-mon [options] [--] prog [args...]
   -e, --env VAR=VAL      add an environment variable (repeatable)
   -t, --timeout MS       readiness budget (default 5000)
   -r, --restart          respawn the child when it exits
+      --restart-max N    give up after N restarts (default: never)
   -f, --foreground       do not detach; supervise in place
   -k, --no-close         leave stdio as inherited
   -R, --reap             become a child subreaper where the kernel allows
@@ -52,6 +53,7 @@ struct Opts {
     envs: Vec<OsString>,
     timeout_ms: u64,
     restart: bool,
+    restart_max: u64,
     foreground: bool,
     no_close: bool,
     reap: bool,
@@ -72,6 +74,7 @@ impl Default for Opts {
             envs: Vec::new(),
             timeout_ms: 5000,
             restart: false,
+            restart_max: 0,
             foreground: false,
             no_close: false,
             reap: false,
@@ -128,6 +131,10 @@ fn main() -> ExitCode {
             "--stop-timeout" => match number(&mut args) {
                 Some(n) => o.stop_secs = n,
                 None => return fail(&o, "--stop-timeout needs seconds"),
+            },
+            "--restart-max" => match number(&mut args) {
+                Some(n) => o.restart_max = n,
+                None => return fail(&o, "--restart-max needs a count"),
             },
             "--stop-signal" => match args.next() {
                 Some(v) => o.stop_signal = v,
@@ -259,10 +266,19 @@ fn run(o: &Opts, tail: Vec<OsString>) -> ExitCode {
         })
         .reap(o.reap);
     if o.restart {
+        // 0 means "no limit", which is the old behaviour; anything else is a
+        // crash-loop cap the operator asked for.
+        let max = if o.restart_max == 0 {
+            u32::MAX
+        } else {
+            o.restart_max.min(u32::MAX as u64) as u32
+        };
         cmd = cmd.restart(Restart::Always {
-            max: u32::MAX,
+            max,
             backoff: Duration::from_secs(1),
         });
+    } else if o.restart_max > 0 {
+        return fail(o, "--restart-max needs --restart");
     }
     if o.no_close {
         cmd = cmd

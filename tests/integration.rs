@@ -1063,3 +1063,43 @@ fn stop_signal_is_honoured_end_to_end() {
     assert!(!text.contains("TERM"), "both signals arrived: {text:?}");
     drop(guard);
 }
+
+#[test]
+fn restart_max_gives_up() {
+    // The CLI never gave up on a crash loop; --restart-max is the cap a
+    // supervisor script actually wants.
+    let pidfile = tmp("maxloop.pid");
+    let count = tmp("maxloop.txt");
+    let _ = fs::remove_file(&count);
+    let o = run(&[
+        "-r",
+        "--restart-max",
+        "1",
+        "-p",
+        pidfile.to_str().unwrap(),
+        "-l",
+        &tmp("maxloop.log").to_string_lossy(),
+        "/bin/sh",
+        "-c",
+        &format!("echo x >> {}; exit 1", count.display()),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+
+    // One start plus one restart, then the supervisor gives up and goes away.
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let gone = run(&["status", "-p", pidfile.to_str().unwrap()]).status.code() == Some(1);
+        if gone || Instant::now() > until {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let lines = fs::read_to_string(&count).map(|s| s.lines().count()).unwrap_or(0);
+    assert_eq!(lines, 2, "expected one start and one restart, got {lines}");
+    assert_eq!(
+        run(&["status", "-p", pidfile.to_str().unwrap()]).status.code(),
+        Some(1),
+        "the supervisor should have given up"
+    );
+    let _ = fs::remove_file(&count);
+}

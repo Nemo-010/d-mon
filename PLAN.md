@@ -8,7 +8,7 @@ after implementation: writing the fork sequence found ten places where the
 design was wrong or incomplete. They are listed in §0.1. The third review round
 was the compiler and the machine, so those changes are marked **[R3]**.
 
-**Status: M1–M6 implemented and tested.** 35 integration tests and 13 unit
+**Status: M1–M6 implemented and tested.** 36 integration tests and 13 unit
 tests pass; one more is marked `#[ignore]` because it needs a PID namespace
 (see §9). The static `x86_64-unknown-linux-musl` binary is 463,536 bytes.
 
@@ -293,7 +293,8 @@ effective set and would make the scrub fail `EPERM`.
 ```
 d-mon [options] [--] prog [args...]
   -l --logfile  -p --pidfile  -C --chdir  -u --user  -g --group
-  -e --env  -t --timeout  -r --restart  -f --foreground  -k --no-close
+  -e --env  -t --timeout  -r --restart  --restart-max N  -f --foreground
+  -k --no-close
   -R --reap  --stop-signal SIG  --stop-timeout SECS  --json  -v
 
 d-mon status  [-p PATH] [--json]
@@ -393,9 +394,9 @@ Known gaps after M6:
 * **PID 1 is untested here.** The code is written and the test exists, but this
   kernel refuses `unshare -pf`, so the test prints `SKIPPED` and the path is
   unverified until it runs somewhere that allows a PID namespace.
-* `Restart::max` is the only crash-loop cap, and the CLI's `--restart` passes
-  `u32::MAX`, so the CLI itself never gives up. Deliberate, but it is a gap for
-  anyone who wanted `--restart` to be safe by default.
+* `--restart` on its own never gives up; `--restart-max N` is how you ask it
+  to. The default is unlimited because a supervisor script that silently stops
+  restarting is worse than one that hammers a log.
 * A non-init subreaper cannot enumerate the orphans it adopted without reading
   `/proc`, which this design refuses to do, so it reports the main child's exit
   and leaves them to be reparented.
@@ -411,9 +412,8 @@ Known gaps after M6:
 1. `StopPolicy` default: `SIGTERM`, 10 s grace, then `SIGKILL` — **yes**, and it
    is what `--stop-timeout` overrides.
 2. Crash-loop cap: **the caller's policy**, via `Restart::max`. The CLI's
-   `--restart` passes `u32::MAX`, so it does not cap; that is a deliberate
-   choice for a CLI that should not invent a limit, and it is documented as a
-   gap rather than a feature.
+   `--restart` still does not invent a limit, but `--restart-max N` exists for
+   the operator who wants one, so the gap is a default rather than a hole.
 3. Control verbs: **in scope**, but as a separate `ctl` module talking to the
    pidfile rather than a socket, so there is no new listening surface and no
    `d-mon-ctl` binary to keep in step. See §6.1.
