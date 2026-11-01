@@ -12,16 +12,26 @@ kernel refuses `unshare -pf`.
 
 ## Why another one
 
-Because the existing ones cannot tell you whether your program started.
+Because a daemonizer that cannot say whether the program started is not one you
+can put in a unit file or a container entrypoint, and a daemonizer that leaves
+its delegate able to acquire a terminal is not a daemonizer.
 
-Measured:
+Measured in this checkout (`x86_64`, glibc, kernel 7.2):
 
-| | result |
+| probe | result |
 |---|---|
-| `busybox start-stop-daemon -S -b -x /nonexistent/prog` | exit **0**, no output |
-| the same with `-m -p x.pid` | pidfile written, process absent |
-| `fiorix/go-daemon` | reports the exec error, but `main` ignores `waitpid` and exits **0** |
-| glibc `daemon(3)` with a broken `/dev/null` | forks, `_exit`s the parent, *then* returns `-1` in a child nobody is watching |
+| `catatonit -- /nonexistent/prog` | exit **1**, names the exec failure — honest, and the standard to match |
+| `catatonit -- /bin/sh -c 'exit 3'` | exit **3**, the delegate's status |
+| glibc `daemon(0,0)`, via [`probes/daemon3-session.c`](probes/daemon3-session.c) | the surviving process has `getsid(0) == getpid()`: it is a **session leader**, so a single fork plus `setsid` |
+| `d-mon … /bin/sleep 5` | the supervisor is **neither a session leader nor a process group leader**; both belong to the intermediate, which exited |
+
+Quoted from [PLAN.md](PLAN.md) §1, not re-measured here because the tool is not
+installed in this environment:
+
+| claim | source |
+|---|---|
+| `busybox start-stop-daemon -S -b -x /nonexistent/prog` → exit **0**, no output; with `-m -p` it writes a pidfile for a process that does not exist | PLAN §1, from the `-b` path returning before `execve` |
+| `fiorix/go-daemon` reports the exec error but `main` ignores `waitpid` and exits **0** | PLAN §1, from `god.c` |
 
 ```
 $ d-mon /nonexistent/prog

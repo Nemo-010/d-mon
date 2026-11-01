@@ -66,6 +66,14 @@ silently writing to the first one's self-pipe.
 | `god` reports the exec error but not the exit | `god.c`: `main` does `waitpid(pid, NULL, 0)` and `return 0` |
 | `/dev/null` assumed | `bmc/daemonize`: `die("Can't open /dev/null")` |
 | correct readiness exists only in libraries | `immortal/fork::checked_daemon` |
+| `daemon(3)` leaves the survivor able to take a terminal | **measured**: `probes/daemon3-session.c` reports `getsid(0) == getpid()`, i.e. a session leader |
+| `catatonit` is honest about a failed start | **measured**: `catatonit -- /nonexistent/prog` → exit 1, and it propagates the delegate's status |
+
+Provenance: the two rows marked **measured** were run when M6 landed, on this
+machine. The rest come from the source or man page named in the row and were
+not re-run here — busybox, tini, s6 and supervisord are not installed in this
+environment, so quoting them as "measured here" would be a claim I cannot
+support.
 
 ## 2. Goals
 
