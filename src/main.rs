@@ -279,10 +279,38 @@ fn run(o: &Opts, tail: Vec<OsString>) -> ExitCode {
         }
     }
 
+    if o.verbose {
+        eprintln!(
+            "d-mon: {} {} -> {}",
+            if o.foreground { "supervising" } else { "detaching" },
+            prog.to_string_lossy(),
+            if o.foreground {
+                "in place".to_string()
+            } else {
+                "into its own session".to_string()
+            }
+        );
+        if let Some(p) = &o.logfile {
+            eprintln!("d-mon: log {}", p.to_string_lossy());
+        }
+        if let Some(p) = &o.pidfile {
+            eprintln!("d-mon: pidfile {}", p.to_string_lossy());
+        }
+        eprintln!(
+            "d-mon: readiness budget {} ms, stop {}/{} s",
+            o.timeout_ms,
+            o.stop_signal.to_string_lossy(),
+            o.stop_secs
+        );
+    }
+
     let outcome = if o.foreground {
         match cmd.run() {
             Ok(st) => {
                 let code = st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0));
+                if o.verbose {
+                    eprintln!("d-mon: delegate exited with {code}");
+                }
                 if o.json {
                     println!("{{\"outcome\":\"exited\",\"code\":{code}}}");
                 }
@@ -292,6 +320,13 @@ fn run(o: &Opts, tail: Vec<OsString>) -> ExitCode {
         }
     } else {
         cmd.daemonize().map(|s| {
+            if o.verbose {
+                eprintln!(
+                    "d-mon: started supervisor {}, delegate {}",
+                    s.supervisor(),
+                    s.child()
+                );
+            }
             if o.json {
                 println!(
                     "{{\"outcome\":\"started\",\"mode\":\"resident\",\"supervisor\":{},\"child\":{}}}",

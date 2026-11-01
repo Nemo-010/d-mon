@@ -822,3 +822,177 @@ fn dashdash_runs_a_program_named_like_a_verb() {
     assert!(text.contains("dd"), "got {text:?}");
     let _ = fs::remove_file(&log);
 }
+
+// ---- behaviours that were advertised but never exercised ---------------
+
+#[test]
+fn a_bare_name_is_resolved_through_path() {
+    let pidfile = tmp("path.pid");
+    let o = run(&[
+        "-p",
+        pidfile.to_str().unwrap(),
+        "-l",
+        &tmp("path.log").to_string_lossy(),
+        "sleep",
+        "30",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let guard = Guard::from_pidfile(&pidfile);
+    assert!(alive(guard.0));
+
+    let bad = run(&["definitely-not-on-path-xyz", "1"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(stderr(&bad).contains("ENOENT"), "{}", stderr(&bad));
+}
+
+#[test]
+fn chdir_and_env_reach_the_delegate() {
+    let out = tmp("chdir.txt");
+    let _ = fs::remove_file(&out);
+    let script = format!("pwd > {}; echo $GREETING >> {}", out.display(), out.display());
+    let o = run(&[
+        "-C",
+        "/tmp",
+        "-e",
+        "GREETING=hello-from-dmon",
+        "-l",
+        &tmp("chdir.log").to_string_lossy(),
+        "/bin/sh",
+        "-c",
+        &script,
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let text = wait_for_file(&out);
+    assert!(text.contains("/tmp"), "chdir did not apply: {text:?}");
+    assert!(text.contains("hello-from-dmon"), "env did not apply: {text:?}");
+    let _ = fs::remove_file(&out);
+}
+
+#[test]
+fn the_delegate_reads_eof_on_stdin_when_detached() {
+    // Detached, stdin is the null device, so a reader must not block.
+    let out = tmp("stdin.txt");
+    let _ = fs::remove_file(&out);
+    let o = run(&[
+        "-l",
+        &tmp("stdin.log").to_string_lossy(),
+        "/bin/sh",
+        "-c",
+        &format!("cat > /dev/null; echo eof >> {}", out.display()),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let text = wait_for_file(&out);
+    assert!(text.contains("eof"), "stdin was not a null sink: {text:?}");
+    let _ = fs::remove_file(&out);
+}
+
+#[test]
+fn stop_times_out_with_its_own_exit_code() {
+    // The delegate ignores TERM and the supervisor's grace is long; a stop that
+    // waits one second must report that it could not confirm the stop, not
+    // pretend it worked.
+    let pidfile = tmp("slowstop.pid");
+    let ready = tmp("slowstop.ready");
+    let _ = fs::remove_file(&ready);
+    let o = run(&[
+        "-l",
+        &tmp("slowstop.log").to_string_lossy(),
+        "-p",
+        pidfile.to_str().unwrap(),
+        "/bin/sh",
+        "-c",
+        &format!("trap '' TERM; : > {}; sleep 60", ready.display()),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let guard = Guard::from_pidfile(&pidfile);
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !ready.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "the delegate never installed its trap");
+
+    let st = run(&[
+        "stop",
+        "--stop-timeout",
+        "1",
+        "-p",
+        pidfile.to_str().unwrap(),
+    ]);
+    assert_eq!(st.status.code(), Some(2), "stderr: {}", stderr(&st));
+    drop(guard);
+}
+
+#[test]
+fn capture_without_a_log_is_refused_by_the_library() {
+    use d_mon::Stdio;
+    let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let err = d_mon::Command::new("/bin/echo")
+        .arg("hi")
+        .stdout(Stdio::Capture)
+        .run()
+        .expect_err("capture needs somewhere to write");
+    let text = err.to_string();
+    assert!(text.contains("capture"), "{text}");
+}
+
+#[test]
+fn stdio_file_appends_where_it_is_told() {
+    use d_mon::Stdio;
+    let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let out = tmp("stdiofile.txt");
+    let _ = fs::remove_file(&out);
+    let st = d_mon::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("echo from-the-delegate")
+        .stdout(Stdio::File(out.clone()))
+        .run()
+        .expect("run()");
+    assert!(st.success());
+    let text = fs::read_to_string(&out).unwrap_or_default();
+    assert!(text.contains("from-the-delegate"), "got {text:?}");
+    let _ = fs::remove_file(&out);
+}
+
+#[test]
+fn restart_stops_at_its_limit() {
+    // `Restart::max` is the caller's crash-loop cap; the supervisor must honour
+    // it rather than respawn forever.
+    let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let count = tmp("caploop.txt");
+    let _ = fs::remove_file(&count);
+    let st = d_mon::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("echo x >> {}; exit 1", count.display()))
+        .restart(d_mon::Restart::OnFailure {
+            max: 2,
+            backoff: Duration::from_millis(20),
+        })
+        .run()
+        .expect("run()");
+    assert_eq!(st.code(), Some(1), "the delegate's own exit status");
+    let lines = fs::read_to_string(&count).map(|s| s.lines().count()).unwrap_or(0);
+    assert_eq!(lines, 3, "one start plus two restarts, got {lines}");
+    let _ = fs::remove_file(&count);
+}
+
+#[test]
+fn verbose_says_what_it_decided() {
+    let pidfile = tmp("verbose.pid");
+    let o = run(&[
+        "-v",
+        "-p",
+        pidfile.to_str().unwrap(),
+        "-l",
+        &tmp("verbose.log").to_string_lossy(),
+        "/bin/sleep",
+        "20",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let guard = Guard::from_pidfile(&pidfile);
+    let e = stderr(&o);
+    assert!(e.contains("detaching"), "{e}");
+    assert!(e.contains("started supervisor"), "{e}");
+    // -v must not write to stdout, or --json consumers would break.
+    assert!(stdout(&o).is_empty(), "stdout: {}", stdout(&o));
+    drop(guard);
+}

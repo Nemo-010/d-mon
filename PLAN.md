@@ -8,7 +8,7 @@ after implementation: writing the fork sequence found ten places where the
 design was wrong or incomplete. They are listed in §0.1. The third review round
 was the compiler and the machine, so those changes are marked **[R3]**.
 
-**Status: M1–M6 implemented and tested.** 27 integration tests and 10 unit
+**Status: M1–M6 implemented and tested.** 35 integration tests and 10 unit
 tests pass; the static `x86_64-unknown-linux-musl` binary is 463,536 bytes.
 
 ---
