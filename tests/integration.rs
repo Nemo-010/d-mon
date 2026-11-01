@@ -482,10 +482,18 @@ fn wait_for_file(p: &Path) -> String {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
-/// PID 1 is the role d-mon cannot test as an ordinary process. The test asks
-/// the kernel for a namespace; where that is refused it says so and skips,
-/// because a silently-skipped test is a lie.
+/// PID 1 is the role d-mon cannot test as an ordinary process.
+///
+/// This test is **ignored by default**, not quietly passing. A test that
+/// returns early and is still counted as a pass tells a reader that PID 1 works,
+/// which is the opposite of what it knows. Run it deliberately, somewhere that
+/// allows a PID namespace:
+///
+/// ```text
+/// cargo test -- --ignored pid1
+/// ```
 #[test]
+#[ignore = "needs CAP_SYS_ADMIN or unprivileged userns; run with --ignored where unshare -pf works"]
 fn pid1_reaps_and_forwards() {
     let probe = Command::new("unshare")
         .args(["-pf", "--mount-proc", "true"])
@@ -493,9 +501,9 @@ fn pid1_reaps_and_forwards() {
     let permitted = matches!(probe, Ok(s) if s.success());
     if !permitted {
         eprintln!(
-            "SKIPPED pid1_reaps_and_forwards: this kernel will not create a PID \
-             namespace for us (no CAP_SYS_ADMIN and no unprivileged user namespace). \
-             The PID 1 path is exercised only where `unshare -pf` works."
+            "pid1_reaps_and_forwards was asked to run, but this kernel will not \
+             create a PID namespace (no CAP_SYS_ADMIN and no unprivileged user \
+             namespace). The PID 1 path is exercised only where `unshare -pf` works."
         );
         return;
     }

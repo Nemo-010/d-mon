@@ -8,8 +8,9 @@ after implementation: writing the fork sequence found ten places where the
 design was wrong or incomplete. They are listed in §0.1. The third review round
 was the compiler and the machine, so those changes are marked **[R3]**.
 
-**Status: M1–M6 implemented and tested.** 36 integration tests and 13 unit
-tests pass; the static `x86_64-unknown-linux-musl` binary is 463,536 bytes.
+**Status: M1–M6 implemented and tested.** 35 integration tests and 13 unit
+tests pass; one more is marked `#[ignore]` because it needs a PID namespace
+(see §9). The static `x86_64-unknown-linux-musl` binary is 463,536 bytes.
 
 ---
 
@@ -382,9 +383,9 @@ M3 exec contract, signal reset, privilege order — **done** (signal reset and f
    hygiene asserted against `/proc/self/status` and `/proc/self/fd`)
 M4 supervisor, log, pidfile, stop policy — **done** (SIGHUP rotation, grace then
    SIGKILL, exactly one winner under 25 concurrent starts)
-M5 reaper, PID 1 — **done for the detached supervisor**; the PID 1 path is
-   written but **untested here**: this kernel refuses `unshare -pf`, so the test
-   skips loudly rather than claim a pass.
+M5 reaper, PID 1 — **done for the detached supervisor**, but the PID 1 path is
+   **unverified**: this kernel refuses `unshare -pf`, so the test is `#[ignore]`d
+   rather than counted as a pass it did not earn.
 M6 control verbs (`status`/`signal`/`stop`), docs, matrix — **done** (§6.1)
 
 Known gaps after M6:
