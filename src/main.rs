@@ -3,14 +3,17 @@
 
 use std::ffi::OsString;
 use std::process::ExitCode;
+use std::time::Duration;
 
-use d_mon::command::Command;
+use d_mon::command::{Command, Id, Restart, StopPolicy};
 use d_mon::error::Error;
+use d_mon::sys;
+use d_mon::Stdio;
 
 const USAGE: &str = "\
 usage: d-mon [options] [--] prog [args...]
 
-  -l, --logfile PATH     capture stdout+stderr (no /dev/null needed)
+  -l, --logfile PATH     capture stdout+stderr into PATH
   -p, --pidfile PATH     lock and write a pidfile
   -C, --chdir DIR        chdir before exec
   -u, --user USER|UID    drop privileges
@@ -21,6 +24,8 @@ usage: d-mon [options] [--] prog [args...]
   -f, --foreground       do not detach; supervise in place
   -k, --no-close         leave stdio as inherited
   -R, --reap             become a child subreaper where the kernel allows
+      --stop-signal SIG  signal sent on stop (default TERM)
+      --stop-timeout S   grace before SIGKILL (default 10)
       --json             machine-readable outcome
   -v, --verbose          say what is happening
   -h, --help             this text
@@ -29,20 +34,49 @@ usage: d-mon [options] [--] prog [args...]
 exit: 0 started, 1 failed to start, 2 unconfirmed, 3 already running
 ";
 
+struct Opts {
+    logfile: Option<OsString>,
+    pidfile: Option<OsString>,
+    chdir: Option<OsString>,
+    user: Option<OsString>,
+    group: Option<OsString>,
+    envs: Vec<OsString>,
+    timeout_ms: u64,
+    restart: bool,
+    foreground: bool,
+    no_close: bool,
+    reap: bool,
+    stop_signal: OsString,
+    stop_secs: u64,
+    json: bool,
+    verbose: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            logfile: None,
+            pidfile: None,
+            chdir: None,
+            user: None,
+            group: None,
+            envs: Vec::new(),
+            timeout_ms: 5000,
+            restart: false,
+            foreground: false,
+            no_close: false,
+            reap: false,
+            stop_signal: OsString::from("TERM"),
+            stop_secs: 10,
+            json: false,
+            verbose: false,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1).peekable();
-    let mut logfile = None;
-    let mut pidfile = None;
-    let mut chdir = None;
-    let mut user = None;
-    let mut group = None;
-    let mut envs: Vec<OsString> = Vec::new();
-    let mut timeout_ms: u64 = 5000;
-    let mut restart = false;
-    let mut foreground = false;
-    let mut no_close = false;
-    let mut reap = false;
-    let mut verbose = false;
+    let mut o = Opts::default();
 
     while let Some(a) = args.next() {
         let s = a.to_string_lossy().into_owned();
@@ -56,82 +90,80 @@ fn main() -> ExitCode {
                 println!("d-mon {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
-            "-l" | "--logfile" => logfile = args.next(),
-            "-p" | "--pidfile" => pidfile = args.next(),
-            "-C" | "--chdir" => chdir = args.next(),
-            "-u" | "--user" => user = args.next(),
-            "-g" | "--group" => group = args.next(),
+            "-l" | "--logfile" => o.logfile = args.next(),
+            "-p" | "--pidfile" => o.pidfile = args.next(),
+            "-C" | "--chdir" => o.chdir = args.next(),
+            "-u" | "--user" => o.user = args.next(),
+            "-g" | "--group" => o.group = args.next(),
             "-e" | "--env" => match args.next() {
-                Some(v) => envs.push(v),
-                None => return fail("--env needs VAR=VAL"),
+                Some(v) => o.envs.push(v),
+                None => return fail(&o, "--env needs VAR=VAL"),
             },
-            "-t" | "--timeout" => match args.next().and_then(|v| v.to_str().map(str::to_owned)) {
-                Some(v) => match v.parse() {
-                    Ok(n) => timeout_ms = n,
-                    Err(_) => return fail("--timeout needs milliseconds"),
-                },
-                None => return fail("--timeout needs milliseconds"),
+            "-t" | "--timeout" => match number(&mut args) {
+                Some(n) => o.timeout_ms = n,
+                None => return fail(&o, "--timeout needs milliseconds"),
             },
-            "-r" | "--restart" => restart = true,
-            "-f" | "--foreground" => foreground = true,
-            "-k" | "--no-close" => no_close = true,
-            "-R" | "--reap" => reap = true,
-            "-v" | "--verbose" => verbose = true,
-            _ if s.starts_with('-') => return fail(&format!("unknown option {s}")),
+            "--stop-timeout" => match number(&mut args) {
+                Some(n) => o.stop_secs = n,
+                None => return fail(&o, "--stop-timeout needs seconds"),
+            },
+            "--stop-signal" => match args.next() {
+                Some(v) => o.stop_signal = v,
+                None => return fail(&o, "--stop-signal needs a signal"),
+            },
+            "-r" | "--restart" => o.restart = true,
+            "-f" | "--foreground" => o.foreground = true,
+            "-k" | "--no-close" => o.no_close = true,
+            "-R" | "--reap" => o.reap = true,
+            "--json" => o.json = true,
+            "-v" | "--verbose" => o.verbose = true,
+            _ if s.starts_with('-') => return fail(&o, &format!("unknown option {s}")),
             _ => {
-                // This is the program; put it back by rebuilding the tail.
                 let mut tail = vec![a];
                 tail.extend(args);
-                return run(
-                    tail, logfile, pidfile, chdir, user, group, envs, timeout_ms, restart,
-                    foreground, no_close, reap, verbose,
-                );
+                return run(&o, tail);
             }
         }
     }
 
-    fail("no program given (try --help)")
+    fail(&o, "no program given (try --help)")
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(
-    tail: Vec<OsString>,
-    logfile: Option<OsString>,
-    pidfile: Option<OsString>,
-    chdir: Option<OsString>,
-    user: Option<OsString>,
-    group: Option<OsString>,
-    envs: Vec<OsString>,
-    timeout_ms: u64,
-    restart: bool,
-    foreground: bool,
-    no_close: bool,
-    reap: bool,
-    verbose: bool,
-) -> ExitCode {
+fn number(args: &mut impl Iterator<Item = OsString>) -> Option<u64> {
+    args.next()?.to_str()?.parse().ok()
+}
+
+fn run(o: &Opts, tail: Vec<OsString>) -> ExitCode {
     let mut it = tail.into_iter();
-    let prog = match it.next() {
-        Some(p) => p,
-        None => return fail("no program given"),
+    let Some(prog) = it.next() else {
+        return fail(o, "no program given");
+    };
+
+    let stop_signal = match parse_signal(&o.stop_signal) {
+        Some(s) => s,
+        None => return fail(o, "unknown --stop-signal"),
     };
 
     let mut cmd = Command::new(&prog).args(it);
-    if let Some(p) = logfile {
-        cmd = cmd.log_file(p);
+    if let Some(p) = &o.logfile {
+        cmd = cmd
+            .log_file(p)
+            .stdout(Stdio::Capture)
+            .stderr(Stdio::Capture);
     }
-    if let Some(p) = pidfile {
+    if let Some(p) = &o.pidfile {
         cmd = cmd.pid_file(p);
     }
-    if let Some(d) = chdir {
+    if let Some(d) = &o.chdir {
         cmd = cmd.current_dir(d);
     }
-    if let Some(u) = user {
-        cmd = cmd.user(d_mon::Id::Name(u.to_string_lossy().into_owned()));
+    if let Some(u) = &o.user {
+        cmd = cmd.user(as_id(u));
     }
-    if let Some(g) = group {
-        cmd = cmd.group(d_mon::Id::Name(g.to_string_lossy().into_owned()));
+    if let Some(g) = &o.group {
+        cmd = cmd.group(as_id(g));
     }
-    for e in envs {
+    for e in &o.envs {
         if let Some(s) = e.to_str() {
             if let Some((k, v)) = s.split_once('=') {
                 cmd = cmd.env(k, v);
@@ -139,50 +171,137 @@ fn run(
         }
     }
     cmd = cmd
-        .ready_timeout(std::time::Duration::from_millis(timeout_ms))
-        .stop(d_mon::StopPolicy::default());
-    if restart {
-        cmd = cmd.restart(d_mon::Restart::Always {
+        .ready_timeout(Duration::from_millis(o.timeout_ms))
+        .stop(StopPolicy {
+            signal: stop_signal,
+            grace: Duration::from_secs(o.stop_secs),
+        })
+        .reap(o.reap);
+    if o.restart {
+        cmd = cmd.restart(Restart::Always {
             max: u32::MAX,
-            backoff: std::time::Duration::from_secs(1),
+            backoff: Duration::from_secs(1),
         });
     }
-    if no_close {
-        cmd = cmd.stdout(d_mon::Stdio::Inherit).stderr(d_mon::Stdio::Inherit);
+    if o.no_close {
+        cmd = cmd
+            .stdin(Stdio::Inherit)
+            .stdout(Stdio::Inherit)
+            .stderr(Stdio::Inherit);
+    } else if !o.foreground {
+        // A detached delegate that keeps the caller's stdout holds the pipe
+        // open, so `out=$(d-mon prog)` never returns. Discard is the default
+        // off the terminal; `-k` is how you ask for inheritance anyway.
+        cmd = cmd.stdin(Stdio::Discard);
+        if o.logfile.is_none() {
+            cmd = cmd.stdout(Stdio::Discard).stderr(Stdio::Discard);
+        }
     }
-    let _ = reap;
-    let _ = verbose;
 
-    if foreground {
+    let outcome = if o.foreground {
         match cmd.run() {
             Ok(st) => {
-                if st.success() {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::from(st.code().unwrap_or(1) as u8)
+                let code = st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0));
+                if o.json {
+                    println!("{{\"outcome\":\"exited\",\"code\":{code}}}");
                 }
+                return ExitCode::from(code.clamp(0, 255) as u8);
             }
-            Err(e) => report(e),
+            Err(e) => Err(e),
         }
     } else {
-        match cmd.daemonize() {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(e) => report(e),
-        }
+        cmd.daemonize().map(|s| {
+            if o.json {
+                println!(
+                    "{{\"outcome\":\"started\",\"mode\":\"resident\",\"supervisor\":{},\"child\":{}}}",
+                    s.supervisor(),
+                    s.child()
+                );
+            }
+        })
+    };
+
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => report(o, e),
     }
 }
 
-fn report(e: Error) -> ExitCode {
-    eprintln!("d-mon: {e}");
-    match e {
-        Error::Unconfirmed { .. } => ExitCode::from(2),
-        Error::Spawn { .. } => ExitCode::from(1),
-        Error::Env { .. } => ExitCode::from(1),
-        _ => ExitCode::from(1),
+use std::os::unix::process::ExitStatusExt;
+
+fn as_id(s: &OsString) -> Id {
+    match s.to_str().and_then(|v| v.parse::<u32>().ok()) {
+        Some(n) => Id::Numeric(n),
+        None => Id::Name(s.to_string_lossy().into_owned()),
     }
 }
 
-fn fail(msg: &str) -> ExitCode {
-    eprintln!("d-mon: {msg}");
+fn parse_signal(s: &OsString) -> Option<i32> {
+    let t = s.to_string_lossy().to_ascii_uppercase();
+    let t = t.strip_prefix("SIG").unwrap_or(&t);
+    Some(match t {
+        "HUP" => sys::SIGHUP,
+        "INT" => sys::SIGINT,
+        "QUIT" => sys::SIGQUIT,
+        "TERM" => sys::SIGTERM,
+        "USR1" => sys::SIGUSR1,
+        "USR2" => sys::SIGUSR2,
+        "KILL" => sys::SIGKILL,
+        other => other.parse().ok()?,
+    })
+}
+
+fn report(o: &Opts, e: Error) -> ExitCode {
+    let code = e.exit_code();
+    if o.json {
+        let body = match &e {
+            Error::Spawn {
+                program,
+                stage,
+                errno,
+                syscall,
+                path,
+            } => {
+                let mut s = format!(
+                    "{{\"outcome\":\"failed\",\"stage\":\"{stage}\",\"errno\":{errno},\"syscall\":\"{syscall}\",\"program\":\"{}\"",
+                    escape(&program.to_string_lossy())
+                );
+                if let Some(p) = path {
+                    s.push_str(&format!(",\"path\":\"{}\"", escape(&p.to_string_lossy())));
+                }
+                s.push('}');
+                s
+            }
+            Error::Unconfirmed { waited, killed } => format!(
+                "{{\"outcome\":\"unconfirmed\",\"waited_ms\":{},\"killed\":{killed}}}",
+                waited.as_millis()
+            ),
+            Error::AlreadyRunning { path, pid } => format!(
+                "{{\"outcome\":\"already-running\",\"pidfile\":\"{}\",\"pid\":{}}}",
+                escape(&path.to_string_lossy()),
+                pid.map(|p| p.to_string()).unwrap_or_else(|| "null".into())
+            ),
+            Error::Env { op, errno, .. } => {
+                format!("{{\"outcome\":\"env\",\"op\":\"{op}\",\"errno\":{errno}}}")
+            }
+            _ => "{\"outcome\":\"failed\"}".to_string(),
+        };
+        println!("{body}");
+    } else {
+        eprintln!("d-mon: {e}");
+    }
+    ExitCode::from(code)
+}
+
+fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn fail(o: &Opts, msg: &str) -> ExitCode {
+    if o.json {
+        println!("{{\"outcome\":\"error\",\"message\":\"{}\"}}", escape(msg));
+    } else {
+        eprintln!("d-mon: {msg}");
+    }
     ExitCode::from(1)
 }

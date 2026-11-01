@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::daemon::{self, Started};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::stdio::Stdio;
 
 /// A user or group, resolved the way the target environment can support.
@@ -63,12 +63,13 @@ pub struct Command {
     pub(crate) group: Option<Id>,
     pub(crate) stdout: Stdio,
     pub(crate) stderr: Stdio,
+    pub(crate) stdin_stdio: Stdio,
     pub(crate) log_file: Option<PathBuf>,
     pub(crate) pid_file: Option<PathBuf>,
     pub(crate) restart: Restart,
     pub(crate) stop: StopPolicy,
     pub(crate) ready_timeout: Duration,
-    pub(crate) foreground: bool,
+    pub(crate) reap: bool,
 }
 
 impl Command {
@@ -84,13 +85,20 @@ impl Command {
             group: None,
             stdout: Stdio::Inherit,
             stderr: Stdio::Inherit,
+            stdin_stdio: Stdio::Inherit,
             log_file: None,
             pid_file: None,
             restart: Restart::Never,
             stop: StopPolicy::default(),
             ready_timeout: Duration::from_millis(5000),
-            foreground: false,
+            reap: false,
         }
+    }
+
+    /// Descriptor policy for the child's standard input.
+    pub fn stdin(mut self, s: Stdio) -> Self {
+        self.stdin_stdio = s;
+        self
     }
 
     pub fn arg(mut self, a: impl AsRef<OsStr>) -> Self {
@@ -175,18 +183,40 @@ impl Command {
         self
     }
 
+    /// Become a child subreaper in `run()`, so orphaned grandchildren are
+    /// reparented to this process instead of init. Off by default: the
+    /// attribute survives `execve`, so turning an embedding host into a reaper
+    /// is a change the caller must ask for.
+    pub fn reap(mut self, yes: bool) -> Self {
+        self.reap = yes;
+        self
+    }
+
     /// Detach, and return as soon as the outcome is known.
     ///
     /// Returns `Ok` only when the program really did exec. A failed start is an
     /// `Err`, so `?` cannot swallow it.
     pub fn daemonize(self) -> Result<Started> {
-        daemon::daemonize(self)
+        let program = self.program.clone();
+        let pid_file = self.pid_file.clone();
+        daemon::daemonize(self).map_err(|e| match (e, &pid_file) {
+            // The launcher learns the fact from a record that does not carry the
+            // path; the command does.
+            (Error::AlreadyRunning { path, pid }, Some(p)) if path.as_os_str().is_empty() => {
+                Error::AlreadyRunning {
+                    path: p.clone(),
+                    pid,
+                }
+            }
+            (e, _) => e.named(&program),
+        })
     }
 
     /// Stay in the foreground and supervise. This is what a container entrypoint
     /// should call: it reaps, forwards signals, and never claims to have started
     /// something it did not.
     pub fn run(self) -> Result<std::process::ExitStatus> {
-        daemon::run(self)
+        let program = self.program.clone();
+        daemon::run(self).map_err(|e| e.named(&program))
     }
 }

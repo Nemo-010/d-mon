@@ -3,9 +3,11 @@
 Daemonize a program, supervise it, and reap when it is allowed to.
 One static binary, zero dependencies, usable as a CLI and as a library.
 
-**Status: skeleton.** The design is settled (see [PLAN.md](PLAN.md)) and the
-protocol types are final; the fork sequence and supervisor loop land in M2–M5.
-`daemonize()` and `run()` currently return `ENOSYS`.
+**Status: M1–M5 done.** The detach sequence, the exec contract, the supervisor,
+the log and pidfile are implemented and tested (20 integration tests, 10 unit
+tests). 455 KB static `x86_64-unknown-linux-musl` binary. The design and the
+defects it was corrected for are in [PLAN.md](PLAN.md); the PID 1 path is
+written but untested here, because this kernel refuses `unshare -pf`.
 
 ## Why another one
 
@@ -20,42 +22,81 @@ Measured:
 | `fiorix/go-daemon` | reports the exec error, but `main` ignores `waitpid` and exits **0** |
 | glibc `daemon(3)` with a broken `/dev/null` | forks, `_exit`s the parent, *then* returns `-1` in a child nobody is watching |
 
-`d-mon` returns `Ok` only when the program really reached `execve`, and a
-failed start is an `Err`, so `?` cannot swallow it.
+```
+$ d-mon /nonexistent/prog
+d-mon: /nonexistent/prog: failed at exec: ENOENT (execve)
+$ echo $?
+1
+```
 
 ## Design contract
 
 * **Startup is honest.** Three outcomes: started, failed (with stage, errno and
-  syscall), unconfirmed. Exit codes `0` / `1` / `2`.
-* **Nothing is assumed.** No shell, no `/proc`, no `/dev/null`, no `setsid(1)`,
-  no `/etc/passwd` for numeric ids. Each absence degrades, and the degradation
-  is reported.
+  syscall), unconfirmed. Exit codes `0` / `1` / `2`, and `3` for a pidfile that
+  is already locked.
+* **Nothing is assumed.** No shell, no `/proc`, no `/dev/null`, no `/etc/passwd`
+  for numeric ids. Each absence degrades, and the degradation is reported.
 * **Reaping is explicit.** `getpid() == 1` reaps automatically; otherwise
   becoming a subreaper is opt-in, because the attribute survives `execve` and
   silently converting an embedding host into a reaper is a bug, not a feature.
 * **The child gets a clean signal state.** The blocked mask, and Rust's
   `SIGPIPE = SIG_IGN`, are reset before `execve` — otherwise the daemon starts
   with `SIGTERM` blocked and `docker stop` becomes `docker kill`.
+* **The child inherits nothing above fd 2**, and the readiness pipe closes on
+  `execve`, which is how the launcher learns the program really ran.
+
+## Usage
+
+```sh
+d-mon -l /var/log/app.log -p /run/app.pid -- /usr/bin/app --serve
+d-mon -f -- /usr/bin/app --serve          # supervise in place (container entrypoint)
+d-mon --json -p app.pid -- /usr/bin/app   # one machine-readable line
+```
+
+Detached, the delegate's stdio defaults to discarded; `-l` captures it into the
+log, and `-k` leaves it as inherited.
+
+## Library
+
+```rust
+use d_mon::Command;
+
+let started = Command::new("/usr/bin/app")
+    .arg("--serve")
+    .log_file("/var/log/app.log")
+    .pid_file("/run/app.pid")
+    .ready_timeout(std::time::Duration::from_secs(5))
+    .daemonize()?;
+println!("supervisor {}, child {}", started.supervisor(), started.child());
+```
+
+`run()` supervises in the current process and returns the delegate's exit
+status; `daemonize()` returns as soon as the outcome is known.
+
+One `Supervisor` per process at a time: a signal handler is process-wide, so a
+second one gets `EBUSY` rather than racing the first for the self-pipe.
 
 ## Layout
 
 ```
-src/sys.rs    raw FFI; the only unsafe surface in the crate
-src/ready.rs  readiness records and the launcher state machine
-src/daemon.rs detach sequence
-src/reaper.rs subreaper lifecycle, waitpid policy
-src/command.rs the builder
+src/sys.rs        raw FFI; the only unsafe surface in the crate
+src/ready.rs      readiness records and the launcher state machine
+src/exec.rs       ExecPlan: everything materialised before the fork
+src/daemon.rs     the detach sequence
+src/supervisor.rs the poll loop: forwarding, restart, stop policy, drains
+src/reaper.rs     subreaper lifecycle, waitpid policy
+src/log.rs        append sink, inode-verified reopen on SIGHUP
+src/pidfile.rs    flock on the final inode, verified against the path
+src/stdio.rs      Discard's degradation chain, capture pipes
+src/main.rs       the CLI
 ```
 
 ## Build
 
 ```sh
 cargo build --release
-```
+cargo test
 
-Static:
-
-```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```

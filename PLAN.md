@@ -1,10 +1,37 @@
-# d-mon — design (v3, after two review rounds)
+# d-mon — design (v4, as implemented)
 
 `d-mon` daemonizes a program, supervises it, and reaps when it is allowed to.
 CLI and library. Rust, zero dependencies, static build. 0BSD.
 
-v3 is the result of two rounds of adversarial review (8 reviewers). Every
-change is marked with the round that forced it. v1/v2 are in git history.
+v3 was the result of two rounds of adversarial review (8 reviewers). v4 is v3
+after implementation: writing the fork sequence found ten places where the
+design was wrong or incomplete. They are listed in §0.1. The third review round
+was the compiler and the machine, so those changes are marked **[R3]**.
+
+**Status: M1–M5 implemented and tested.** 21 integration tests and 10 unit
+tests pass; the static `x86_64-unknown-linux-musl` binary is 455 KB. M6 (control
+verbs) is not started.
+
+---
+
+## 0.1 Defects found while implementing v3, and what replaced them
+
+| v3 said | why it broke | v4 |
+|---|---|---|
+| the child calls `setsid()` | after the double fork the child is already in a session with no controlling terminal *and* is not a session leader, which is what actually prevents ctty reacquisition. `setsid` there would make it a leader again — the `daemon(3)` defect of §1 | no `setsid` in the child; the intermediate calls it and the survivor keeps that session **[R3]** |
+| `setpgid` fallback when `setsid` fails | `setsid` failure is fatal, so the branch is unreachable | removed **[R3]** |
+| `Mode::Replaced` | nothing produces it; a variant no code returns is a lie in the API | `Mode::Resident` only, `#[non_exhaustive]` **[R3]** |
+| stdio: `Inherit` everywhere | a detached supervisor that keeps the caller's stdout holds the write end of `out=$(d-mon prog)`, so the pipeline never returns | the supervisor points its own 0/1/2 at `/dev/null` after the fork; the CLI defaults a detached delegate to `Discard`, and `-k` restores inheritance **[R3]** |
+| `waitpid(-1)` when a subreaper | `run()` became a subreaper whenever reaping was allowed, and then reaped *the embedding process's* children | subreaper only on the detached path or an explicit `reap(true)`; otherwise the loop waits on the pid it forked **[R3]** |
+| pidfile: `flock` the final inode | correct, but a starter could lock an inode the exiting supervisor had just unlinked, and then hold a lock nobody can see | after `flock`, `fstat(fd)` and `stat(path)` are compared and the attempt retried on a mismatch; the file is unlinked *before* the lock is released **[R3]** |
+| restart policy applies to any exit | a `-r` supervisor answered SIGTERM by spawning the child again, so it never stopped | a stop request outranks the restart policy **[R3]** |
+| one readiness pipe, the supervisor announces itself | in `run()` the supervisor *is* the launcher, so no `Super` record is ever sent and a good start reads as "EOF with no record" | the tracker is seeded with the supervisor's own pid/pgid in `run()` **[R3]** |
+| timeout kills "the process group" | with a zero budget the launcher may not have received `Super` yet, so it knew no pid and killed nothing | it always kills the intermediate, which is the session and process group of everything the attempt created **[R3]** |
+| a pidfile is always removed | a SIGKILLed supervisor cannot remove it | removal is promised on clean exit only; the lock dies with the process, so a leftover never blocks a start **[R3]** |
+
+Also **[R3]**: a signal handler belongs to the process, so exactly one
+`Supervisor` may be live in a process. A second one gets `EBUSY` instead of
+silently writing to the first one's self-pipe.
 
 ---
 
@@ -115,9 +142,8 @@ impl Command {
     pub fn run(self) -> Result<ExitStatus, Error>;
 }
 
-pub enum Mode {                                  // [R2]
+pub enum Mode {                                  // [R3]
     Resident { supervisor: Pid, child: Pid },    // d-mon survives to supervise
-    Replaced { child: Pid },                     // d-mon exec'd itself away
 }
 
 pub struct Started { pub mode: Mode }
@@ -169,18 +195,27 @@ closed the fd; the `kill(pid,0)` check catches immediate death. A process that
 execs and then fails to bind is still `Started` — no tool can know without
 cooperation, and the docs say so.
 
-### 5.2 Exec contract — **[R2] raw syscalls, not libc**
+### 5.2 Exec contract — **[R3] raw syscalls, not libc**
 
-Pre-fork, materialised into `ExecPlan`: `argv`/`envp` as `CString`, program
-path resolved absolute, `getpwnam`/`getgrnam`/`getgrouplist` resolved, log and
-pidfile opened, `close_range` plan chosen.
+Pre-fork, materialised into `ExecPlan`: `argv`/`envp` as `CString` and their
+`NULL`-terminated pointer arrays (the child must not allocate, because a `fork`
+in a threaded process can leave the allocator locked by a thread that does not
+exist in the child), program path resolved absolute, `getpwnam`/`getgrnam`/
+getgrouplist` resolved, log, pidfile and stdio descriptors opened.
 
-In the child, between `fork` and `execve`, **only** these, via `SYS_*`:
+In the child, between `fork` and `execve`, **only** these:
 
 ```
-dup2 close close_range rt_sigprocmask rt_sigaction setpgid setsid
-setgroups setgid setuid umask chdir prctl write execve exit_group
+prctl dup2 fcntl(F_SETFD) rt_sigprocmask sigaction setgroups setgid setuid
+umask chdir write execve exit_group
 ```
+
+`setsid`, `setpgid` and `close_range` are **not** in the list. The session was
+created by the intermediate before the supervisor was forked, so the child
+inherits a ctty-less session in which it is not a leader — the state that makes
+ctty reacquisition impossible. Descriptors above 2 are marked `FD_CLOEXEC` one
+by one rather than closed, because `close_range` would take the readiness pipe
+with it and `CLOSE_RANGE_CLOEXEC` needs kernel 5.11.
 
 `initgroups` is **not** used in the child (it mallocs, reads `/etc/group`, runs
 NSS, is not async-signal-safe). The group list is resolved pre-fork and applied
@@ -189,12 +224,6 @@ with `setgroups`.
 **Signal state is reset**: empty mask, `SIG_DFL` for every signal d-mon
 touched *and* `SIGPIPE` (Rust sets it to `SIG_IGN`, and ignored dispositions
 survive `execve`).
-
-**`setpgid(0,0)` is only called when `setsid` failed** — after a successful
-`setsid`, `setpgid` returns `EPERM` because the process is a session leader.
-
-**`setsid` failure is fatal**: without a new session the process keeps the
-caller's session and can reacquire a controlling terminal.
 
 **`PR_SET_PDEATHSIG(SIGTERM)`** in the child, followed by
 `getppid() == 1 → _exit`, closing the race.
@@ -257,6 +286,11 @@ d-mon [options] [--] prog [args...]
 `{"outcome":"started","mode":"resident","supervisor":12,"child":13}`
 `{"outcome":"failed","stage":"exec","errno":2,"syscall":"execve","program":"/x"}`
 
+Detached, the delegate's stdio defaults to `Discard`, not `Inherit`: a daemon
+holding the caller's stdout keeps `out=$(d-mon prog)` from ever returning.
+`-k` asks for inheritance anyway; `-l` captures into the log file. `-f` keeps
+inheritance, because attached supervision is the point of `-f`.
+
 ## 7. Failure matrix — **[R2] corrected**
 
 | Situation | d-mon | god | busybox s-s-d | bmc/daemonize | tini | catatonit |
@@ -289,12 +323,25 @@ interfaces d-mon lacks (M6 scope).
 
 ## 9. Milestones
 
-M1 skeleton, sys FFI, `--help`, static build
-M2 readiness (six states) + `--json`
-M3 exec contract, signal reset, privilege order
-M4 supervisor, log, pidfile, stop policy
-M5 reaper, PID 1
+M1 skeleton, sys FFI, `--help`, static build — **done**
+M2 readiness (six states) + `--json` — **done** (six states unit-tested; `-t 0`
+   exercises the timeout over a real pipe)
+M3 exec contract, signal reset, privilege order — **done** (signal reset and fd
+   hygiene asserted against `/proc/self/status` and `/proc/self/fd`)
+M4 supervisor, log, pidfile, stop policy — **done** (SIGHUP rotation, grace then
+   SIGKILL, exactly one winner under 25 concurrent starts)
+M5 reaper, PID 1 — **done for the detached supervisor**; the PID 1 path is
+   written but **untested here**: this kernel refuses `unshare -pf`, so the test
+   skips loudly rather than claim a pass.
 M6 control verbs (`status`/`signal`), docs, matrix
+
+Known gaps after M5:
+
+* `StopPolicy`/`Restart` are honoured but there is no crash-loop cap beyond
+  `Restart::max`; `--restart` on the CLI passes `u32::MAX`.
+* A non-init subreaper cannot enumerate the orphans it adopted without reading
+  `/proc`, which this design refuses to do, so it reports the main child's exit
+  and leaves them to be reparented.
 
 ## 10. Remaining open questions
 

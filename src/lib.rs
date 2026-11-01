@@ -25,16 +25,20 @@
 pub mod command;
 pub mod daemon;
 pub mod error;
+pub mod exec;
+pub mod log;
+pub mod pidfile;
 pub mod ready;
 pub mod reaper;
 pub mod stdio;
+pub(crate) mod supervisor;
 pub mod sys;
 
 pub use command::{Command, Id, Restart, StopPolicy};
 pub use daemon::{Mode, Started};
-pub use error::{Error, Result, Stage};
+pub use error::{Error, Fail, Result, Stage};
 pub use reaper::Reap;
-pub use stdio::Stdio;
+pub use stdio::{Sink, Stdio};
 
 /// True when this process is the init of its PID namespace.
 pub fn is_pid1() -> bool {
